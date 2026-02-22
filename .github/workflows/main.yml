@@ -1,0 +1,257 @@
+name: Build SM6225 Kernel 4.19.325 — RKSU + SUSFS (auto)
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: 'Defconfig filename in arch/arm64/configs (default: defconfig)'
+        required: true
+        default: 'defconfig'
+      susfs_zip:
+        description: 'susfs zip filename in repo root (default: susfs-fixed.zip)'
+        required: true
+        default: 'susfs-fixed.zip'
+
+env:
+  OUTDIR: out
+  CLANG_TAR: https://github.com/llvm/llvm-project/releases/download/llvmorg-17.0.6/clang+llvm-17.0.6-x86_64-linux-gnu-ubuntu-22.04.tar.xz
+  ANYKERNEL_REPO: https://github.com/osm0sis/AnyKernel3
+  MAKE_JOBS: ${{ runner.cores }}
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout repo (full)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install base dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y git bc bison flex build-essential \
+            libssl-dev libncurses5-dev crossbuild-essential-arm64 \
+            curl wget unzip zip patch python3 python3-distutils ccache
+
+      - name: Download & install clang 17 (safe)
+        run: |
+          echo "Downloading clang..."
+          wget -q --show-progress "${CLANG_TAR}" -O clang.tar.xz
+          tar -xf clang.tar.xz
+          EXDIR=$(ls -d clang+llvm-* | head -n1)
+          mv "$EXDIR" clang
+          echo "$PWD/clang/bin" >> $GITHUB_PATH
+          rm -f clang.tar.xz
+          echo "clang installed to $PWD/clang"
+
+      - name: Configure git identity (safe for any commits)
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+      - name: Extract susfs-fixed.zip if present (or use susfs-fixed/ folder)
+        id: extract
+        run: |
+          SUSFS_ZIP="${{ github.event.inputs.susfs_zip }}"
+          echo "Looking for susfs-fixed/ folder or ZIP: $SUSFS_ZIP"
+          if [ -d susfs-fixed ]; then
+            echo "susfs-fixed/ directory exists — will use it"
+            echo "SRC=susfs-fixed" >> $GITHUB_ENV
+          elif [ -f "$SUSFS_ZIP" ]; then
+            echo "Found $SUSFS_ZIP — extracting..."
+            mkdir -p susfs-extract
+            unzip -o "$SUSFS_ZIP" -d susfs-extract
+            # support zip that contains susfs-fixed/ or contains the files directly
+            if [ -d susfs-extract/susfs-fixed ]; then
+              mv susfs-extract/susfs-fixed ./susfs-fixed
+            else
+              mkdir -p susfs-fixed
+              mv susfs-extract/* susfs-fixed/ || true
+            fi
+            rm -rf susfs-extract
+            echo "SRC=susfs-fixed" >> $GITHUB_ENV
+          else
+            echo "No susfs-fixed folder or zip found. Will attempt fallback."
+            echo "SRC=" >> $GITHUB_ENV
+          fi
+          echo "Extraction step done."
+
+      - name: Fallback: fetch minimal SUSFS core files if missing
+        if: env.SRC == ''
+        run: |
+          echo "SRC empty — cloning public SUSFS fork for fallback..."
+          git clone --depth 1 https://github.com/sidex15/susfs4ksu.git susfs-fallback || true
+          mkdir -p susfs-fixed/include/linux
+          mkdir -p susfs-fixed/fs
+          if [ -f susfs-fallback/include/linux/susfs_def.h ]; then
+            cp -v susfs-fallback/include/linux/susfs_def.h susfs-fixed/include/linux/ || true
+          fi
+          if [ -f susfs-fallback/fs/susfs.c ]; then
+            cp -v susfs-fallback/fs/susfs.c susfs-fixed/fs/ || true
+          fi
+          echo "SRC=susfs-fixed" >> $GITHUB_ENV
+
+      - name: Show susfs-fixed contents (debug)
+        run: |
+          echo "SRC=$SRC"
+          if [ -d susfs-fixed ]; then
+            echo "susfs-fixed tree (top-level):"
+            find susfs-fixed -maxdepth 4 -type f | sed -n '1,200p' || true
+          else
+            echo "susfs-fixed not present"
+          fi
+
+      - name: Copy SUSFS fixed files into kernel tree (overwrite)
+        run: |
+          if [ -d susfs-fixed ]; then
+            cp -rv susfs-fixed/* .
+          else
+            echo "No susfs-fixed — continuing without copying (will likely fail)"
+          fi
+
+      - name: Ensure fs/Makefile contains susfs object line
+        run: |
+          if [ -f fs/Makefile ]; then
+            if ! grep -q "obj-\\$(CONFIG_KSU_SUSFS) += susfs.o" fs/Makefile; then
+              echo "" >> fs/Makefile
+              echo "# SUSFS object added by workflow" >> fs/Makefile
+              echo "obj-\$(CONFIG_KSU_SUSFS) += susfs.o" >> fs/Makefile
+              echo "Appended susfs object to fs/Makefile"
+            else
+              echo "fs/Makefile already contains susfs object"
+            fi
+          else
+            echo "fs/Makefile not found — creating minimal Makefile with susfs object"
+            mkdir -p fs
+            echo "obj-\$(CONFIG_KSU_SUSFS) += susfs.o" > fs/Makefile
+          fi
+
+      - name: Patch include/linux/mount.h (idempotent)
+        run: |
+          if [ -f include/linux/mount.h ]; then
+            if ! grep -q "susfs_mnt_id_backup" include/linux/mount.h; then
+              awk '{
+                print
+                if ($0 ~ /ANDROID_KABI_RESERVE\(4\);/ && !x) {
+                  print ""
+                  print "#ifdef CONFIG_KSU_SUSFS"
+                  print "\tANDROID_KABI_USE(4, u64 susfs_mnt_id_backup);"
+                  print "#else"
+                  print "\tANDROID_KABI_RESERVE(4);"
+                  print "#endif"
+                  print "#if defined(CONFIG_KSU_SUSFS) && !defined(ANDROID_KABI_RESERVE)"
+                  print "\tu64 susfs_mnt_id_backup;"
+                  print "#endif"
+                  x=1
+                }
+              }' include/linux/mount.h > /tmp/mount.h && mv /tmp/mount.h include/linux/mount.h
+              echo "Patched include/linux/mount.h"
+            else
+              echo "include/linux/mount.h already contains susfs_mnt_id_backup — skipping"
+            fi
+          else
+            echo "include/linux/mount.h not found — skipping patch"
+          fi
+
+      - name: Patch include/linux/sched.h (insert susfs_task_state)
+        run: |
+          if [ -f include/linux/sched.h ]; then
+            if ! grep -q "susfs_task_state" include/linux/sched.h; then
+              awk 'BEGIN{p=1} { print; if(p && $0 ~ /struct[ \t]+task_struct[ \t]*\{/) { print ""; print "#ifdef CONFIG_KSU_SUSFS"; print "\tu64 susfs_task_state;"; print "#endif"; p=0 } }' include/linux/sched.h > /tmp/sched.h && mv /tmp/sched.h include/linux/sched.h
+              echo "Patched include/linux/sched.h"
+            else
+              echo "include/linux/sched.h already patched — skipping"
+            fi
+          else
+            echo "include/linux/sched.h not found — skipping patch"
+          fi
+
+      - name: Ensure kernel/kallsyms.c includes susfs_def.h
+        run: |
+          if [ -f kernel/kallsyms.c ]; then
+            if ! grep -q "susfs_def.h" kernel/kallsyms.c; then
+              sed -i '1i#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs_def.h>\n#endif\n' kernel/kallsyms.c && echo "Inserted susfs_def.h include into kernel/kallsyms.c"
+            else
+              echo "kernel/kallsyms.c already contains susfs_def.h include"
+            fi
+          else
+            echo "kernel/kallsyms.c not found — skipping"
+          fi
+
+      - name: Ensure defconfig has SUSFS flags (idempotent)
+        run: |
+          DEF="${{ github.event.inputs.defconfig }}"
+          DPATH="arch/arm64/configs/${DEF}"
+          if [ ! -f "$DPATH" ]; then
+            echo "Defconfig $DPATH not found. Listing arch/arm64/configs:"
+            ls -la arch/arm64/configs || true
+            exit 1
+          fi
+          grep -q '^CONFIG_KSU_SUSFS=' "$DPATH" || echo 'CONFIG_KSU_SUSFS=y' >> "$DPATH"
+          grep -q '^CONFIG_KSU_SUSFS_SUS_PATH=' "$DPATH" || echo 'CONFIG_KSU_SUSFS_SUS_PATH=y' >> "$DPATH"
+          grep -q '^CONFIG_KSU_SUSFS_OPEN_REDIRECT=' "$DPATH" || echo 'CONFIG_KSU_SUSFS_OPEN_REDIRECT=y' >> "$DPATH"
+          echo "Updated $DPATH with SUSFS flags if they were missing."
+
+      - name: Show quick tree (debug)
+        run: |
+          echo "Top-level files:"
+          ls -la | sed -n '1,200p'
+          echo "include/linux (few):"
+          ls -la include/linux | sed -n '1,200p' || true
+          echo "fs (few):"
+          ls -la fs | sed -n '1,200p' || true
+
+      - name: Build kernel (clang, O=out)
+        env:
+          PATH: ${{ runner.workspace }}/clang/bin:$PATH
+        run: |
+          set -euo pipefail
+          export ARCH=arm64
+          export O=${OUTDIR}
+          export CC=clang
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          DEF="${{ github.event.inputs.defconfig }}"
+          mkdir -p ${O}
+          # try to use provided defconfig target, fallback to 'defconfig' target
+          if make O=${O} ${DEF}; then
+            echo "Ran make ${DEF}"
+          else
+            echo "make ${DEF} failed or not present, running make defconfig"
+            make O=${O} defconfig
+          fi
+          make -j${MAKE_JOBS} O=${O} ARCH=${ARCH} CC=${CC} CROSS_COMPILE=${CROSS_COMPILE}
+          make -j${MAKE_JOBS} O=${O} modules || true
+
+      - name: Package release (Image + dtbs + modules)
+        run: |
+          mkdir -p release
+          cp -v ${OUTDIR}/arch/arm64/boot/Image release/ 2>/dev/null || true
+          cp -v ${OUTDIR}/arch/arm64/boot/Image.gz release/ 2>/dev/null || true
+          cp -v ${OUTDIR}/arch/arm64/boot/Image.lz4 release/ 2>/dev/null || true
+          find ${OUTDIR}/arch/arm64/boot/dts -name '*.dtb' -exec cp -v {} release/ \; 2>/dev/null || true
+          if [ -d ${OUTDIR}/lib/modules ]; then
+            tar -czf release/modules.tar.gz -C ${OUTDIR}/lib modules || true
+          fi
+          ls -la release || true
+
+      - name: Prepare AnyKernel (optional)
+        run: |
+          if [ ! -d AnyKernel ]; then
+            git clone --depth 1 "${ANYKERNEL_REPO}" AnyKernel || true
+          fi
+          # copy kernel image if present
+          cp -v release/Image AnyKernel/ || cp -v release/Image.lz4 AnyKernel/ || true
+          (cd AnyKernel && zip -r9 ../SM6225-AnyKernel-SUSFS.zip * -x '*.git*') || true || true
+
+      - name: Upload artifacts (images + susfs-fixed + anykernel)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sm6225-kernel-susfs
+          path: |
+            release/**
+            susfs-fixed/**
+            SM6225-AnyKernel-SUSFS.zip
